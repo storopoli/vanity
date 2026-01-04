@@ -1,6 +1,6 @@
 cabal-version:   3.0
 name:            vanity
-version:         0.1.0
+version:         0.2.0
 synopsis:        Blazingly fast Bitcoin vanity address generator
 license:         MIT
 license-file:    LICENSE
@@ -74,13 +74,31 @@ library
 
   if flag(cuda)
     exposed-modules: Crypto.Bitcoin.Vanity.Worker.CUDA
+    other-modules:   Crypto.Bitcoin.Vanity.FFI.CUDA
     build-depends:   cuda >=0.11 && <0.12
     cpp-options:     -DCUDA_ENABLED
+    include-dirs:    cbits
+    c-sources:
+      cbits/encoding/base58.c
+      cbits/encoding/bech32.c
+      cbits/hash/ripemd160.c
+      cbits/hash/sha256.c
+      cbits/secp256k1/ecmult.c
+      cbits/secp256k1/field.c
+      cbits/secp256k1/group.c
+      cbits/secp256k1/scalar.c
+
+    -- Note: CUDA .cu files require nvcc compilation via custom Setup.hs
+    extra-libraries:
+      cuda
+      cudart
 
   if flag(wgpu)
     exposed-modules: Crypto.Bitcoin.Vanity.Worker.WGPU
     build-depends:   wgpu-hs >=0.4 && <0.5
     cpp-options:     -DWGPU_ENABLED
+
+-- Note: WGSL shaders are in shaders/ directory
 
 executable vanity
   import:           warnings
