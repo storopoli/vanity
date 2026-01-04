@@ -1,0 +1,13 @@
+cradle:
+  cabal:
+    - path: "lib"
+      component: "lib:vanity"
+
+    - path: "app/Main.hs"
+      component: "vanity:exe:vanity"
+
+    - path: "test"
+      component: "vanity:test:vanity-tests"
+
+    - path: "bench/Main.hs"
+      component: "vanity:bench:vanity-bench"

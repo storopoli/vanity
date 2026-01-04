@@ -1,0 +1,12 @@
+# Changelog
+
+## 0.1.0 (2026-01-04)
+
+Initial release.
+
+- Support for P2PKH (Base58), P2WPKH (Bech32), P2TR (Bech32m) address types
+- Mainnet and testnet support
+- POSIX regex pattern matching with case-insensitive option
+- Multi-threaded CPU backend
+- CLI with progress reporting
+- WIF and hex private key output
