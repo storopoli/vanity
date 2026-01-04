@@ -674,3 +674,298 @@ int vanity_wgpu_is_available(void) {
     return 0;
 #endif
 }
+
+/* ============================================================================
+ * Hybrid GPU/CPU Implementation
+ * GPU does EC multiplication, CPU does hashing/encoding/matching
+ * ============================================================================ */
+
+#if WGPU_AVAILABLE
+
+/* Hybrid-specific state */
+static struct {
+    WGPUShaderModule shader;
+    WGPUComputePipeline pipeline;
+    WGPUBindGroupLayout bind_group_layout;
+    WGPUBuffer config_buffer;
+    WGPUBuffer scalar_buffer;
+    WGPUBuffer results_buffer;
+    WGPUBuffer results_staging;
+    int pipeline_created;
+    uint32_t batch_size;
+} g_hybrid = {0};
+
+#endif /* WGPU_AVAILABLE */
+
+int vanity_wgpu_create_hybrid_pipeline(const char* shader_code, size_t code_len) {
+#if !WGPU_AVAILABLE
+    (void)shader_code;
+    (void)code_len;
+    return WGPU_ERROR_NO_ADAPTER;
+#else
+    if (!g_wgpu.initialized) {
+        return WGPU_ERROR_NO_DEVICE;
+    }
+
+    /* Create shader module */
+    WGPUShaderSourceWGSL wgsl_source = {0};
+    wgsl_source.chain.sType = WGPUSType_ShaderSourceWGSL;
+    wgsl_source.code.data = shader_code;
+    wgsl_source.code.length = code_len;
+
+    WGPUShaderModuleDescriptor shader_desc = {0};
+    shader_desc.nextInChain = (WGPUChainedStruct*)&wgsl_source;
+    shader_desc.label = make_string_view("hybrid_shader");
+
+    g_hybrid.shader = wgpuDeviceCreateShaderModule(g_wgpu.device, &shader_desc);
+    if (!g_hybrid.shader) {
+        g_wgpu.last_error = WGPU_ERROR_SHADER_COMPILE;
+        return WGPU_ERROR_SHADER_COMPILE;
+    }
+
+    /* Create bind group layout - simpler than full pipeline */
+    WGPUBindGroupLayoutEntry layout_entries[3] = {0};
+
+    /* @binding(0): config uniform */
+    layout_entries[0].binding = 0;
+    layout_entries[0].visibility = WGPUShaderStage_Compute;
+    layout_entries[0].buffer.type = WGPUBufferBindingType_Uniform;
+    layout_entries[0].buffer.minBindingSize = sizeof(VanityHybridConfig);
+
+    /* @binding(1): base_scalar storage */
+    layout_entries[1].binding = 1;
+    layout_entries[1].visibility = WGPUShaderStage_Compute;
+    layout_entries[1].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
+    layout_entries[1].buffer.minBindingSize = 32;
+
+    /* @binding(2): results storage */
+    layout_entries[2].binding = 2;
+    layout_entries[2].visibility = WGPUShaderStage_Compute;
+    layout_entries[2].buffer.type = WGPUBufferBindingType_Storage;
+    layout_entries[2].buffer.minBindingSize = sizeof(VanityPubKeyResult);
+
+    WGPUBindGroupLayoutDescriptor layout_desc = {0};
+    layout_desc.label = make_string_view("hybrid_bind_group_layout");
+    layout_desc.entryCount = 3;
+    layout_desc.entries = layout_entries;
+
+    g_hybrid.bind_group_layout = wgpuDeviceCreateBindGroupLayout(
+        g_wgpu.device, &layout_desc);
+    if (!g_hybrid.bind_group_layout) {
+        g_wgpu.last_error = WGPU_ERROR_PIPELINE_CREATE;
+        return WGPU_ERROR_PIPELINE_CREATE;
+    }
+
+    /* Create pipeline layout */
+    WGPUPipelineLayoutDescriptor pipeline_layout_desc = {0};
+    pipeline_layout_desc.label = make_string_view("hybrid_pipeline_layout");
+    pipeline_layout_desc.bindGroupLayoutCount = 1;
+    pipeline_layout_desc.bindGroupLayouts = &g_hybrid.bind_group_layout;
+
+    WGPUPipelineLayout pipeline_layout = wgpuDeviceCreatePipelineLayout(
+        g_wgpu.device, &pipeline_layout_desc);
+
+    /* Create compute pipeline */
+    WGPUComputePipelineDescriptor pipeline_desc = {0};
+    pipeline_desc.label = make_string_view("hybrid_pipeline");
+    pipeline_desc.layout = pipeline_layout;
+    pipeline_desc.compute.module = g_hybrid.shader;
+    pipeline_desc.compute.entryPoint = make_string_view("main");
+
+    g_hybrid.pipeline = wgpuDeviceCreateComputePipeline(
+        g_wgpu.device, &pipeline_desc);
+
+    wgpuPipelineLayoutRelease(pipeline_layout);
+
+    if (!g_hybrid.pipeline) {
+        g_wgpu.last_error = WGPU_ERROR_PIPELINE_CREATE;
+        return WGPU_ERROR_PIPELINE_CREATE;
+    }
+
+    /* Create buffers */
+    WGPUBufferDescriptor buf_desc = {0};
+
+    /* Config buffer */
+    buf_desc.label = make_string_view("hybrid_config_buffer");
+    buf_desc.size = sizeof(VanityHybridConfig);
+    buf_desc.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+    g_hybrid.config_buffer = wgpuDeviceCreateBuffer(g_wgpu.device, &buf_desc);
+
+    /* Scalar buffer */
+    buf_desc.label = make_string_view("hybrid_scalar_buffer");
+    buf_desc.size = 32;
+    buf_desc.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
+    g_hybrid.scalar_buffer = wgpuDeviceCreateBuffer(g_wgpu.device, &buf_desc);
+
+    /* Results will be allocated on first launch based on batch size */
+    g_hybrid.results_buffer = NULL;
+    g_hybrid.results_staging = NULL;
+    g_hybrid.batch_size = 0;
+
+    g_hybrid.pipeline_created = 1;
+    g_wgpu.last_error = WGPU_ERROR_NONE;
+    return WGPU_ERROR_NONE;
+#endif /* WGPU_AVAILABLE */
+}
+
+int vanity_wgpu_launch_hybrid(const VanityHybridConfig* config,
+                              const uint32_t* base_scalar) {
+#if !WGPU_AVAILABLE
+    (void)config;
+    (void)base_scalar;
+    return WGPU_ERROR_NO_ADAPTER;
+#else
+    if (!g_wgpu.initialized || !g_hybrid.pipeline_created) {
+        return WGPU_ERROR_NO_DEVICE;
+    }
+
+    /* Allocate result buffers if needed */
+    if (g_hybrid.batch_size != config->batch_size) {
+        if (g_hybrid.results_buffer) {
+            wgpuBufferRelease(g_hybrid.results_buffer);
+        }
+        if (g_hybrid.results_staging) {
+            wgpuBufferRelease(g_hybrid.results_staging);
+        }
+
+        size_t results_size = sizeof(VanityPubKeyResult) * config->batch_size;
+
+        WGPUBufferDescriptor buf_desc = {0};
+        buf_desc.label = make_string_view("hybrid_results_buffer");
+        buf_desc.size = results_size;
+        buf_desc.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc;
+        g_hybrid.results_buffer = wgpuDeviceCreateBuffer(g_wgpu.device, &buf_desc);
+
+        buf_desc.label = make_string_view("hybrid_results_staging");
+        buf_desc.usage = WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst;
+        g_hybrid.results_staging = wgpuDeviceCreateBuffer(g_wgpu.device, &buf_desc);
+
+        g_hybrid.batch_size = config->batch_size;
+    }
+
+    /* Write data to buffers */
+    wgpuQueueWriteBuffer(g_wgpu.queue, g_hybrid.config_buffer, 0,
+                         config, sizeof(VanityHybridConfig));
+    wgpuQueueWriteBuffer(g_wgpu.queue, g_hybrid.scalar_buffer, 0,
+                         base_scalar, 32);
+
+    /* Create bind group */
+    WGPUBindGroupEntry bind_entries[3] = {0};
+    bind_entries[0].binding = 0;
+    bind_entries[0].buffer = g_hybrid.config_buffer;
+    bind_entries[0].size = sizeof(VanityHybridConfig);
+
+    bind_entries[1].binding = 1;
+    bind_entries[1].buffer = g_hybrid.scalar_buffer;
+    bind_entries[1].size = 32;
+
+    bind_entries[2].binding = 2;
+    bind_entries[2].buffer = g_hybrid.results_buffer;
+    bind_entries[2].size = sizeof(VanityPubKeyResult) * config->batch_size;
+
+    WGPUBindGroupDescriptor bind_group_desc = {0};
+    bind_group_desc.label = make_string_view("hybrid_bind_group");
+    bind_group_desc.layout = g_hybrid.bind_group_layout;
+    bind_group_desc.entryCount = 3;
+    bind_group_desc.entries = bind_entries;
+
+    WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(
+        g_wgpu.device, &bind_group_desc);
+
+    /* Create command encoder */
+    WGPUCommandEncoderDescriptor enc_desc = {0};
+    enc_desc.label = make_string_view("hybrid_encoder");
+    WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(
+        g_wgpu.device, &enc_desc);
+
+    /* Begin compute pass */
+    WGPUComputePassDescriptor pass_desc = {0};
+    pass_desc.label = make_string_view("hybrid_pass");
+    WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(
+        encoder, &pass_desc);
+
+    wgpuComputePassEncoderSetPipeline(pass, g_hybrid.pipeline);
+    wgpuComputePassEncoderSetBindGroup(pass, 0, bind_group, 0, NULL);
+
+    /* Dispatch workgroups (64 threads per workgroup) */
+    uint32_t workgroup_count = (config->batch_size + 63) / 64;
+    wgpuComputePassEncoderDispatchWorkgroups(pass, workgroup_count, 1, 1);
+
+    wgpuComputePassEncoderEnd(pass);
+
+    /* Copy results to staging buffer */
+    wgpuCommandEncoderCopyBufferToBuffer(encoder,
+        g_hybrid.results_buffer, 0,
+        g_hybrid.results_staging, 0,
+        sizeof(VanityPubKeyResult) * config->batch_size);
+
+    /* Submit */
+    WGPUCommandBufferDescriptor cmd_desc = {0};
+    WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, &cmd_desc);
+    wgpuQueueSubmit(g_wgpu.queue, 1, &commands);
+
+    /* Wait for completion */
+    g_wgpu.work_done = 0;
+    WGPUQueueWorkDoneCallbackInfo done_info = {0};
+    done_info.callback = work_done_callback;
+    done_info.mode = WGPUCallbackMode_AllowProcessEvents;
+    wgpuQueueOnSubmittedWorkDone(g_wgpu.queue, done_info);
+
+    while (!g_wgpu.work_done) {
+        wgpuInstanceProcessEvents(g_wgpu.instance);
+    }
+
+    /* Update attempt count */
+    g_wgpu.total_attempts += config->batch_size;
+
+    /* Cleanup */
+    wgpuCommandBufferRelease(commands);
+    wgpuComputePassEncoderRelease(pass);
+    wgpuCommandEncoderRelease(encoder);
+    wgpuBindGroupRelease(bind_group);
+
+    g_wgpu.last_error = WGPU_ERROR_NONE;
+    return WGPU_ERROR_NONE;
+#endif /* WGPU_AVAILABLE */
+}
+
+uint32_t vanity_wgpu_get_pubkeys(VanityPubKeyResult* results, uint32_t max_results) {
+#if !WGPU_AVAILABLE
+    (void)results;
+    (void)max_results;
+    return 0;
+#else
+    if (!g_wgpu.initialized || !g_hybrid.pipeline_created || !results ||
+        !g_hybrid.results_staging) {
+        return 0;
+    }
+
+    uint32_t count = g_hybrid.batch_size;
+    if (count > max_results) count = max_results;
+
+    /* Map staging buffer and read results */
+    g_wgpu.map_done = 0;
+    WGPUBufferMapCallbackInfo map_info = {0};
+    map_info.callback = map_callback;
+    map_info.mode = WGPUCallbackMode_AllowProcessEvents;
+
+    size_t read_size = sizeof(VanityPubKeyResult) * count;
+    wgpuBufferMapAsync(g_hybrid.results_staging, WGPUMapMode_Read, 0,
+                       read_size, map_info);
+
+    while (!g_wgpu.map_done) {
+        wgpuInstanceProcessEvents(g_wgpu.instance);
+    }
+
+    const void* data = wgpuBufferGetConstMappedRange(
+        g_hybrid.results_staging, 0, read_size);
+    if (data) {
+        memcpy(results, data, read_size);
+    } else {
+        count = 0;
+    }
+    wgpuBufferUnmap(g_hybrid.results_staging);
+
+    return count;
+#endif /* WGPU_AVAILABLE */
+}

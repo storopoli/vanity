@@ -31,6 +31,10 @@ module Crypto.Bitcoin.Vanity.FFI.WGPU (
   AddressTypeGPU (..),
   NetworkGPU (..),
 
+  -- * Hybrid types (EC on GPU, rest on CPU)
+  HybridConfig (..),
+  PubKeyResult (..),
+
   -- * Initialization
   wgpuInit,
   wgpuCleanup,
@@ -45,17 +49,22 @@ module Crypto.Bitcoin.Vanity.FFI.WGPU (
   wgpuGetResults,
   wgpuGetAttemptCount,
 
+  -- * Hybrid execution (EC on GPU, rest on CPU)
+  wgpuCreateHybridPipeline,
+  wgpuLaunchHybrid,
+  wgpuGetPubKeys,
+
   -- * Error handling
   WGPUError (..),
   getLastWGPUError,
 ) where
 
 import Data.Word (Word32, Word64, Word8)
-import Foreign.C.String (CString, peekCString)
+import Foreign.C.String (peekCString)
 import Foreign.C.Types (CChar, CInt (..), CSize (..), CUInt (..))
 import Foreign.Marshal.Alloc (alloca, allocaBytes)
 import Foreign.Marshal.Array (peekArray, pokeArray)
-import Foreign.Ptr (FunPtr, Ptr, castPtr, nullPtr, plusPtr)
+import Foreign.Ptr (Ptr, plusPtr)
 import Foreign.Storable (Storable (..), peek, poke)
 
 #include "wgpu_vanity.h"
@@ -119,6 +128,55 @@ data WGPUError
   | WGPUErrorOutOfMemory
   | WGPUErrorUnknown
   deriving (Eq, Show, Enum)
+
+-- | Hybrid config (EC on GPU, rest on CPU)
+data HybridConfig = HybridConfig
+  { hcBatchSize :: !Word32  -- ^ Keys per GPU dispatch
+  }
+  deriving (Eq, Show)
+
+-- | Public key result from hybrid GPU computation
+data PubKeyResult = PubKeyResult
+  { pkScalar :: ![Word32]      -- ^ 256-bit scalar (8 x u32)
+  , pkPubkeyX :: ![Word32]     -- ^ X coordinate (8 x u32, big-endian bytes)
+  , pkPubkeyYParity :: !Word32 -- ^ 0 for even (0x02), 1 for odd (0x03)
+  }
+  deriving (Eq, Show)
+
+-- | C structure for hybrid config
+data CHybridConfig = CHybridConfig
+  { chBatchSize :: !CUInt
+  }
+
+instance Storable CHybridConfig where
+  sizeOf _ = #{size VanityHybridConfig}
+  alignment _ = #{alignment VanityHybridConfig}
+  peek ptr = do
+    bs <- #{peek VanityHybridConfig, batch_size} ptr
+    return CHybridConfig { chBatchSize = bs }
+  poke ptr cfg = do
+    #{poke VanityHybridConfig, batch_size} ptr (chBatchSize cfg)
+
+-- | C structure for pubkey result
+data CPubKeyResult = CPubKeyResult
+  { cpScalar :: ![Word32]
+  , cpPubkeyX :: ![Word32]
+  , cpPubkeyYParity :: !Word32
+  }
+
+instance Storable CPubKeyResult where
+  sizeOf _ = #{size VanityPubKeyResult}
+  alignment _ = #{alignment VanityPubKeyResult}
+  peek ptr = do
+    scalar <- peekArray 8 (#{ptr VanityPubKeyResult, scalar} ptr)
+    pubkeyX <- peekArray 8 (#{ptr VanityPubKeyResult, pubkey_x} ptr)
+    yParity <- #{peek VanityPubKeyResult, pubkey_y_parity} ptr
+    return CPubKeyResult
+      { cpScalar = scalar
+      , cpPubkeyX = pubkeyX
+      , cpPubkeyYParity = yParity
+      }
+  poke _ _ = error "CPubKeyResult: poke not implemented"
 
 -- | C structure for GPU config
 data CWGPUConfig = CWGPUConfig
@@ -301,3 +359,57 @@ getLastWGPUError :: IO WGPUError
 getLastWGPUError = do
   code <- c_wgpu_get_last_error
   return (toEnum (fromIntegral code))
+
+-- ============================================================================
+-- Hybrid API (EC on GPU, rest on CPU)
+-- ============================================================================
+
+foreign import capi unsafe "wgpu_vanity.h vanity_wgpu_create_hybrid_pipeline"
+  c_wgpu_create_hybrid_pipeline :: Ptr CChar -> CSize -> IO CInt
+
+foreign import capi unsafe "wgpu_vanity.h vanity_wgpu_launch_hybrid"
+  c_wgpu_launch_hybrid :: Ptr CHybridConfig -> Ptr Word32 -> IO CInt
+
+foreign import capi unsafe "wgpu_vanity.h vanity_wgpu_get_pubkeys"
+  c_wgpu_get_pubkeys :: Ptr CPubKeyResult -> CUInt -> IO CUInt
+
+-- | Create hybrid compute pipeline (EC multiplication only)
+wgpuCreateHybridPipeline :: String -> IO (Either WGPUError ())
+wgpuCreateHybridPipeline shaderCode = do
+  allocaBytes (length shaderCode + 1) $ \buf -> do
+    pokeArray buf (map (fromIntegral . fromEnum) shaderCode ++ [0])
+    result <- c_wgpu_create_hybrid_pipeline buf (fromIntegral $ length shaderCode)
+    if result == 0
+      then return (Right ())
+      else return (Left (toEnum (fromIntegral result)))
+
+-- | Launch hybrid EC computation on GPU
+wgpuLaunchHybrid :: HybridConfig -> [Word32] -> IO (Either WGPUError ())
+wgpuLaunchHybrid config baseScalar = do
+  let cConfig = CHybridConfig { chBatchSize = fromIntegral (hcBatchSize config) }
+  allocaBytes 32 $ \scalarBuf -> do
+    pokeArray scalarBuf (baseScalar ++ replicate (8 - length baseScalar) 0)
+    alloca $ \configPtr -> do
+      poke configPtr cConfig
+      result <- c_wgpu_launch_hybrid configPtr scalarBuf
+      if result == 0
+        then return (Right ())
+        else return (Left (toEnum (fromIntegral result)))
+
+-- | Get public key results from hybrid computation
+wgpuGetPubKeys :: Word32 -> IO [PubKeyResult]
+wgpuGetPubKeys maxResults = do
+  let bufSize = fromIntegral maxResults
+  allocaBytes (bufSize * #{size VanityPubKeyResult}) $ \buf -> do
+    count <- c_wgpu_get_pubkeys buf (fromIntegral maxResults)
+    if count > 0
+      then do
+        cResults <- peekArray (fromIntegral count) buf
+        return $ map convertResult cResults
+      else return []
+  where
+    convertResult cr = PubKeyResult
+      { pkScalar = cpScalar cr
+      , pkPubkeyX = cpPubkeyX cr
+      , pkPubkeyYParity = cpPubkeyYParity cr
+      }

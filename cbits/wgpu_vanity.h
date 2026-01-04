@@ -40,7 +40,7 @@ typedef struct {
     uint32_t _padding[3];      /* Alignment padding */
 } VanityWGPUConfig;
 
-/* Result from GPU search */
+/* Result from GPU search (full pipeline - deprecated) */
 typedef struct {
     uint32_t scalar[8];        /* 256-bit scalar (private key) */
     uint32_t pubkey_x[8];      /* X coordinate of public key */
@@ -51,6 +51,19 @@ typedef struct {
     uint32_t found;            /* 1 if this is a valid result */
     uint32_t _padding;         /* Alignment */
 } VanityWGPUResult;
+
+/* Result from hybrid GPU search (EC only on GPU) */
+typedef struct {
+    uint32_t scalar[8];        /* 256-bit scalar (private key) */
+    uint32_t pubkey_x[8];      /* X coordinate (big-endian bytes as u32s) */
+    uint32_t pubkey_y_parity;  /* 0 for even Y (0x02), 1 for odd Y (0x03) */
+} VanityPubKeyResult;
+
+/* Hybrid config (simpler than full pipeline) */
+typedef struct {
+    uint32_t batch_size;       /* Keys per GPU dispatch */
+    uint32_t _padding[3];      /* Alignment to 16 bytes */
+} VanityHybridConfig;
 
 /* Device info */
 typedef struct {
@@ -147,6 +160,35 @@ int vanity_wgpu_get_last_error(void);
  * @return 1 if available, 0 if not
  */
 int vanity_wgpu_is_available(void);
+
+/**
+ * Create hybrid compute pipeline (EC multiplication only).
+ *
+ * @param shader_code WGSL shader source code
+ * @param code_len Length of shader code
+ * @return 0 on success, error code on failure
+ */
+int vanity_wgpu_create_hybrid_pipeline(const char* shader_code, size_t code_len);
+
+/**
+ * Launch hybrid EC computation on GPU.
+ * GPU computes public keys, CPU does hashing/encoding/matching.
+ *
+ * @param config Hybrid configuration
+ * @param base_scalar Starting scalar (256-bit as 8 x uint32)
+ * @return 0 on success, error code on failure
+ */
+int vanity_wgpu_launch_hybrid(const VanityHybridConfig* config,
+                              const uint32_t* base_scalar);
+
+/**
+ * Get public key results from hybrid computation.
+ *
+ * @param results Array to receive results
+ * @param max_results Maximum number of results to retrieve
+ * @return Number of results retrieved
+ */
+uint32_t vanity_wgpu_get_pubkeys(VanityPubKeyResult* results, uint32_t max_results);
 
 #ifdef __cplusplus
 }
