@@ -55,7 +55,7 @@ import Foreign.C.String (CString, peekCString)
 import Foreign.C.Types (CChar, CInt (..), CSize (..), CUInt (..))
 import Foreign.Marshal.Alloc (alloca, allocaBytes)
 import Foreign.Marshal.Array (peekArray, pokeArray)
-import Foreign.Ptr (FunPtr, Ptr, castPtr, nullPtr)
+import Foreign.Ptr (FunPtr, Ptr, castPtr, nullPtr, plusPtr)
 import Foreign.Storable (Storable (..), peek, poke)
 
 #include "wgpu_vanity.h"

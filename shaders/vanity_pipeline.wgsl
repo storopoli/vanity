@@ -48,7 +48,8 @@ struct Config {
     iterations: u32,
     batch_size: u32,
     match_mode: u32,        // 0=prefix, 1=suffix, 2=contains
-    _padding: array<u32, 2>,
+    _pad0: u32,
+    _pad1: u32,
 }
 
 // ============================================================================

@@ -15,40 +15,31 @@ module Crypto.Bitcoin.Vanity.Worker.WGPU (
   isWGPUAvailable,
 ) where
 
-import Control.Concurrent (threadDelay)
 import Control.Exception (SomeException, bracket, try)
-import Control.Monad (replicateM, unless, when)
+import Control.Monad (replicateM)
 import Crypto.Bitcoin.Vanity.FFI.WGPU
+import Crypto.Bitcoin.Vanity.Key (derivePublicKey)
 import Crypto.Bitcoin.Vanity.Pattern (PatternError (..))
 import Crypto.Bitcoin.Vanity.Types (
+  Address (..),
   AddressType (..),
   Network (..),
+  Pattern (..),
+  SecretKey (..),
   VanityConfig (..),
   VanityResult (..),
  )
+import Data.Bits (shiftL, (.|.))
 import Data.ByteString qualified as BS
-import Data.ByteString.Char8 qualified as BC
+import Data.Maybe (mapMaybe)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Word (Word32, Word64, Word8)
-import System.IO (hFlush, stdout)
 import System.Random (randomIO)
 
 -- | Batch size for GPU dispatch (number of keys per batch)
 batchSize :: Word32
 batchSize = 1024 * 1024 -- 1M keys per batch
-
--- | Read shader code from embedded data
-getShaderCode :: IO String
-getShaderCode = do
-  -- In production, this would read from the installed data files
-  -- For now, we embed a minimal test shader or read from file
-  pure $
-    unlines
-      [ "// Minimal test shader"
-      , "@compute @workgroup_size(64)"
-      , "fn main() {}"
-      ]
 
 -- | Check if WGPU backend is available
 isWGPUAvailable :: IO Bool
@@ -94,39 +85,28 @@ toGPUConfig config patternBytes =
 generateRandomScalar :: IO [Word32]
 generateRandomScalar = replicateM 8 randomIO
 
--- | Convert GPU result to VanityResult
-fromGPUResult :: VanityGPUResult -> VanityResult
-fromGPUResult gpuResult =
-  VanityResult
-    { vrSecretKeyWIF = T.pack "" -- Will be computed from scalar
-    , vrSecretKeyHex = scalarToHex (resScalar gpuResult)
-    , vrPublicKeyHex = pubkeyToHex (resPubkeyX gpuResult) (resPubkeyYParity gpuResult)
-    , vrAddress = addressFromBytes (resAddress gpuResult)
-    }
+-- | Convert 8 x Word32 (little-endian limbs) to Integer
+word32sToInteger :: [Word32] -> Integer
+word32sToInteger ws = foldr addLimb 0 (zip [0 ..] ws)
  where
-  scalarToHex :: [Word32] -> T.Text
-  scalarToHex ws = T.pack $ concatMap (printf "%08x") (reverse ws)
+  addLimb (i, w) acc = acc .|. (fromIntegral w `shiftL` (i * 32))
 
-  pubkeyToHex :: [Word32] -> Word32 -> T.Text
-  pubkeyToHex xs parity =
-    let prefix = if parity == 0 then "02" else "03"
-     in T.pack $ prefix ++ concatMap (printf "%08x") xs
-
-  addressFromBytes :: [Word8] -> T.Text
-  addressFromBytes = TE.decodeUtf8 . BS.pack
-
-  printf :: String -> Word32 -> String
-  printf _ w =
-    let hex = "0123456789abcdef"
-        toHex n =
-          [ hex !! fromIntegral ((n `div` 16) `mod` 16)
-          , hex !! fromIntegral (n `mod` 16)
-          ]
-        b0 = (w `div` 0x1000000) `mod` 256
-        b1 = (w `div` 0x10000) `mod` 256
-        b2 = (w `div` 0x100) `mod` 256
-        b3 = w `mod` 256
-     in concatMap (toHex . fromIntegral) [b0, b1, b2, b3]
+-- | Convert GPU result to VanityResult
+fromGPUResult :: Word64 -> VanityGPUResult -> Maybe VanityResult
+fromGPUResult attempts gpuResult =
+  let scalar = word32sToInteger (resScalar gpuResult)
+      secretKey = SecretKey scalar
+      addressText = TE.decodeUtf8 $ BS.pack (resAddress gpuResult)
+   in case derivePublicKey secretKey of
+        Nothing -> Nothing
+        Just publicKey ->
+          Just
+            VanityResult
+              { vrSecretKey = secretKey
+              , vrPublicKey = publicKey
+              , vrAddress = Address addressText
+              , vrAttempts = attempts
+              }
 
 -- | Search for a vanity address using WGPU
 searchVanityWithCallback ::
@@ -202,7 +182,7 @@ searchLoop ::
   IO (Either PatternError VanityResult)
 searchLoop config callback = go 0
  where
-  patternText = vcPattern config
+  patternText = unPattern $ vcPattern config
   patternBytes = BS.unpack $ TE.encodeUtf8 patternText
   gpuConfig = toGPUConfig config patternBytes
 
@@ -228,9 +208,7 @@ searchLoop config callback = go 0
         let newTotal = totalAttempts + fromIntegral batchSize
         callback newTotal
 
-        -- Check for matches
-        case results of
-          [] -> go newTotal -- No match, continue
-          (match : _) -> do
-            -- Found a match!
-            pure $ Right $ fromGPUResult match
+        -- Check for matches and find first valid result
+        case mapMaybe (fromGPUResult newTotal) results of
+          (result : _) -> pure $ Right result
+          _ -> go newTotal -- No valid match, continue
