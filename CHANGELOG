@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.2.0 (2026-01-04)
+
+GPU acceleration release.
+
+### Added
+- CUDA GPU backend for NVIDIA GPUs (1000x+ speedup)
+- WGPU GPU backend for cross-platform support (Vulkan, Metal, DirectX)
+- C implementations of secp256k1 field/group arithmetic in `cbits/`
+- GPU-optimized SHA256, RIPEMD160, Base58, and Bech32 encoding
+- FFI bindings for CUDA backend
+- WGSL compute shaders for WGPU backend
+
+### Build Flags
+- `cuda`: Enable NVIDIA CUDA backend (requires CUDA toolkit)
+- `wgpu`: Enable WGPU backend (requires wgpu-native)
+
+### Usage
+```bash
+# Build with CUDA support
+cabal build -f cuda
+
+# Build with WGPU support
+cabal build -f wgpu
+
+# Run with GPU backend
+vanity -b cuda "^1ABC"
+vanity -b wgpu "^bc1q"
+```
+
 ## 0.1.0 (2026-01-04)
 
 Initial release.
