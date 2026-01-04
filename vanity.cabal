@@ -95,8 +95,24 @@ library
 
   if flag(wgpu)
     exposed-modules: Crypto.Bitcoin.Vanity.Worker.WGPU
-    build-depends:   wgpu-hs >=0.4 && <0.5
+    other-modules:   Crypto.Bitcoin.Vanity.FFI.WGPU
+    build-depends:   random >=1.2 && <1.3
     cpp-options:     -DWGPU_ENABLED
+    include-dirs:    cbits
+    c-sources:       cbits/wgpu_vanity.c
+
+    -- Link against wgpu-native library
+    if os(osx)
+      extra-lib-dirs:  /opt/homebrew/lib
+      include-dirs:    /opt/homebrew/include cbits
+      extra-libraries: wgpu_native
+      frameworks:      Metal QuartzCore
+
+    if os(linux)
+      extra-libraries: wgpu_native
+
+    if os(windows)
+      extra-libraries: wgpu_native
 
 -- Note: WGSL shaders are in shaders/ directory
 
