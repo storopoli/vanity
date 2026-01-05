@@ -46,9 +46,12 @@ import Data.Text.Encoding (decodeUtf8)
 import Data.Word (Word32, Word64, Word8)
 import System.Random (randomIO)
 
--- | Batch size for GPU dispatch (number of keys per batch)
+{- | Batch size for GPU dispatch (number of keys per batch)
+Note: EC scalar multiplication is compute-intensive on GPU
+Start with smaller batches for responsive progress updates
+-}
 batchSize :: Word32
-batchSize = 1024 * 1024 -- 1M keys per batch
+batchSize = 16384 -- 16K keys per batch
 
 -- | Check if WGPU backend is available
 isWGPUAvailable :: IO Bool

@@ -5,29 +5,33 @@
 GPU acceleration release.
 
 ### Added
-- CUDA GPU backend for NVIDIA GPUs (1000x+ speedup)
-- WGPU GPU backend for cross-platform support (Vulkan, Metal, DirectX)
-- C implementations of secp256k1 field/group arithmetic in `cbits/`
-- GPU-optimized SHA256, RIPEMD160, Base58, and Bech32 encoding
-- FFI bindings for CUDA backend
-- WGSL compute shaders for WGPU backend
+- WGPU GPU backend for cross-platform GPU support (Metal, Vulkan, DirectX)
+- Hybrid GPU approach: EC scalar multiplication on GPU, hashing/encoding on CPU
+- WGSL compute shader for secp256k1 EC operations (`shaders/ecmult_hybrid.wgsl`)
+- C FFI bindings for wgpu-native (`cbits/wgpu_vanity.c`)
+- Haskell FFI bindings (`lib/Crypto/Bitcoin/Vanity/FFI/WGPU.hsc`)
+
+### Performance
+- GPU throughput: ~88,000 keys/sec on Apple M4 Max (Metal backend)
+- CPU throughput: ~560 keys/sec per thread
+- GPU speedup: ~157x over single CPU thread, ~10x over 16-core CPU
 
 ### Build Flags
-- `cuda`: Enable NVIDIA CUDA backend (requires CUDA toolkit)
-- `wgpu`: Enable WGPU backend (requires wgpu-native)
+- `wgpu`: Enable WGPU backend (requires wgpu-native library)
 
 ### Usage
 ```bash
-# Build with CUDA support
-cabal build -f cuda
-
 # Build with WGPU support
 cabal build -f wgpu
 
-# Run with GPU backend
-vanity -b cuda "^1ABC"
-vanity -b wgpu "^bc1q"
+# Run with GPU backend (P2WPKH or P2TR only)
+vanity -b wgpu "^bc1q" -t p2wpkh
+vanity -b wgpu "^bc1p" -t p2tr
 ```
+
+### Limitations
+- P2PKH (Base58) addresses only supported on CPU backend
+- Requires wgpu-native library installed on system
 
 ## 0.1.0 (2026-01-04)
 
