@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.2.0 (2026-01-04)
+
+GPU acceleration release.
+
+### Added
+- WGPU GPU backend for cross-platform GPU support (Metal, Vulkan, DirectX)
+- Hybrid GPU approach: EC scalar multiplication on GPU, hashing/encoding on CPU
+- WGSL compute shader for secp256k1 EC operations (`shaders/ecmult_hybrid.wgsl`)
+- C FFI bindings for wgpu-native (`cbits/wgpu_vanity.c`)
+- Haskell FFI bindings (`lib/Crypto/Bitcoin/Vanity/FFI/WGPU.hsc`)
+
+### Performance
+- GPU throughput: ~88,000 keys/sec on Apple M4 Max (Metal backend)
+- CPU throughput: ~560 keys/sec per thread
+- GPU speedup: ~157x over single CPU thread, ~10x over 16-core CPU
+
+### Build Flags
+- `wgpu`: Enable WGPU backend (requires wgpu-native library)
+
+### Usage
+```bash
+# Build with WGPU support
+cabal build -f wgpu
+
+# Run with GPU backend (P2WPKH or P2TR only)
+vanity -b wgpu "^bc1q" -t p2wpkh
+vanity -b wgpu "^bc1p" -t p2tr
+```
+
+### Limitations
+- P2PKH (Base58) addresses only supported on CPU backend
+- Requires wgpu-native library installed on system
+
 ## 0.1.0 (2026-01-04)
 
 Initial release.
